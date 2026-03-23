@@ -34,12 +34,12 @@ from selenium.common.exceptions import WebDriverException, TimeoutException
 # Constants
 # ---------------------------------------------------------------------------
 
-SCROLL_STEP_RATIO   = 0.6   # fraction of clientHeight scrolled per step
-EMPTY_LOOP_LIMIT    = 12    # consecutive empty loops before stopping
-MAX_SCROLL_STALLS   = 6     # consecutive no-movement scrolls before stopping
-AUTOSAVE_INTERVAL   = 5     # save + checkpoint every N loops that found new messages
-SCROLL_WAIT_TIMEOUT = 5.0   # max seconds to wait for DOM update after scroll
-SCROLL_WAIT_POLL    = 0.3   # polling interval for DOM-ready check
+SCROLL_STEP_RATIO    = 0.6   # fraction of clientHeight scrolled per step
+EMPTY_LOOP_LIMIT     = 12    # consecutive empty loops before stopping
+MAX_SCROLL_STALLS    = 6     # consecutive no-movement scrolls before stopping
+AUTOSAVE_INTERVAL    = 5     # save + checkpoint every N *productive* loops
+SCROLL_WAIT_TIMEOUT  = 5.0   # max seconds to wait for DOM update after scroll
+SCROLL_WAIT_POLL     = 0.3   # polling interval for DOM-ready check
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +102,10 @@ def make_hash(content: str, timestamp: str, author: str) -> str:
 def checkpoint_path(output_file: str) -> str:
     base, _ = os.path.splitext(output_file)
     return base + ".checkpoint.json"
+
+
+def checkpoint_exists(output_file: str) -> bool:
+    return os.path.exists(checkpoint_path(output_file))
 
 
 def load_checkpoint(output_file: str) -> tuple[set, list]:
@@ -255,6 +259,7 @@ def extract_messages(driver, scroll_element) -> list[dict]:
     Extract visible messages from the scroll container.
     Returns dicts with 'author', 'timestamp', 'content' only —
     no DOM ids or indices, which change between scroll positions.
+    Results are returned in DOM order (top-to-bottom = older-to-newer).
     """
     js = """
     const root = arguments[0];
@@ -364,13 +369,56 @@ def wait_for_scroll_update(driver, scroll_element, prev_scroll_top: float) -> di
 # File I/O
 # ---------------------------------------------------------------------------
 
+def format_message(msg: dict) -> str:
+    return f"[{msg['timestamp']}] {msg['author']}: {msg['content']}"
+
+
 def save_messages(filename: str, ordered_list: list):
+    """Write messages to file. ordered_list must already be in chronological order."""
     with open(filename, "w", encoding="utf-8") as f:
         f.write("\n".join(ordered_list))
 
 
-def check_output_file(output_file: str):
-    """Prompt the user before overwriting an existing file."""
+def resolve_start_mode(output_file: str, no_resume: bool) -> bool:
+    """
+    Decide whether to resume from checkpoint or start fresh.
+
+    FIX: checkpoint state is evaluated *before* asking about overwriting the
+    output file, so a resumable run is not unnecessarily blocked by the
+    overwrite prompt.
+
+    Returns True if resuming, False if starting fresh.
+    """
+    if no_resume:
+        logging.info("Starting fresh (--no-resume).")
+        # Still warn if output file exists and will be overwritten at the end.
+        if os.path.exists(output_file):
+            answer = input(
+                f"\nWARNING: '{output_file}' already exists and --no-resume was set. "
+                f"Overwrite at end of run? [y/N] "
+            ).strip().lower()
+            if answer != "y":
+                print("Aborted.")
+                sys.exit(0)
+        return False
+
+    if checkpoint_exists(output_file):
+        answer = input(
+            f"\nCheckpoint found for '{output_file}'. Resume previous run? [Y/n] "
+        ).strip().lower()
+        if answer in ("", "y"):
+            return True
+        # User declined resume — ask about overwrite before proceeding.
+        if os.path.exists(output_file):
+            answer2 = input(
+                f"'{output_file}' already exists. Overwrite? [y/N] "
+            ).strip().lower()
+            if answer2 != "y":
+                print("Aborted.")
+                sys.exit(0)
+        return False
+
+    # No checkpoint — only ask about overwrite if the file already exists.
     if os.path.exists(output_file):
         answer = input(
             f"\nWARNING: '{output_file}' already exists. Overwrite? [y/N] "
@@ -378,6 +426,7 @@ def check_output_file(output_file: str):
         if answer != "y":
             print("Aborted.")
             sys.exit(0)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +460,8 @@ def main():
 
     output_file = args.output_file
 
-    check_output_file(output_file)
+    # FIX: resolve resume/overwrite before connecting to Chrome.
+    resuming = resolve_start_mode(output_file, args.no_resume)
 
     print("--- TeamsTrawler ---")
 
@@ -453,17 +503,26 @@ def main():
 
         highlight_element(driver, scroll_element, "red")
 
-    if args.no_resume:
-        seen_hashes: set   = set()
-        ordered_list: list = []
-        logging.info("Starting fresh (--no-resume).")
-    else:
+    # FIX: load checkpoint only when resuming; otherwise start fresh.
+    # ordered_list stores dicts so ordering can be fixed up before formatting.
+    if resuming:
         seen_hashes, ordered_list = load_checkpoint(output_file)
+        # checkpoint stores pre-formatted strings for backward compat;
+        # convert to dicts if needed (new runs will store dicts directly)
+        if ordered_list and isinstance(ordered_list[0], str):
+            logging.info(
+                "Checkpoint contains pre-formatted strings from an older run. "
+                "Ordering correction cannot be applied retrospectively."
+            )
+    else:
+        seen_hashes: set   = set()
+        ordered_list: list = []  # list of formatted strings, newest-to-oldest during crawl
 
-    empty_loops   = 0
-    scroll_stalls = 0
-    loop          = 0
-    prev_state    = get_scroll_state(driver, scroll_element)
+    empty_loops      = 0
+    scroll_stalls    = 0
+    loop             = 0
+    productive_loops = 0  # FIX: track loops that actually found new messages
+    prev_state       = get_scroll_state(driver, scroll_element)
 
     while True:
         loop += 1
@@ -481,27 +540,39 @@ def main():
                 loop,
             )
 
+        # FIX: collect new messages from this viewport as an ordered batch.
+        # extract_messages returns items in DOM order (top=older, bottom=newer).
+        # Since we're scrolling upward, this batch is older than anything
+        # appended in previous loops. Prepend the whole batch so that
+        # ordered_list stays in newest-to-oldest order throughout the crawl
+        # (it is reversed to chronological order just once at the very end).
+        new_batch = []
         for msg in messages:
             try:
                 content   = msg["content"]
                 timestamp = msg["timestamp"]
                 author    = msg["author"]
-
-                msg_hash = make_hash(content, timestamp, author)
+                msg_hash  = make_hash(content, timestamp, author)
 
                 if msg_hash not in seen_hashes:
                     seen_hashes.add(msg_hash)
-                    ordered_list.append(f"[{timestamp}] {author}: {content}")
+                    new_batch.append(format_message(msg))
                     new_found += 1
             except Exception as exc:
                 logging.debug("Single message parse failed: %s", exc)
+
+        if new_batch:
+            # new_batch is in DOM order (older → newer within this viewport).
+            # Prepend it so ordered_list remains newest-first overall.
+            ordered_list = new_batch + ordered_list
 
         if new_found == 0:
             empty_loops += 1
             status_color = "orange"
         else:
-            empty_loops = 0
-            status_color = "red"
+            empty_loops      = 0
+            productive_loops += 1  # FIX: only count loops that found something
+            status_color     = "red"
 
         status = (
             f"Loop {loop} | Saved: {len(ordered_list)} | "
@@ -511,9 +582,11 @@ def main():
         print(f"{status:<100}", end="\r")
         inject_status_box(driver, status, status_color)
 
-        if new_found > 0 and loop % AUTOSAVE_INTERVAL == 0:
+        # FIX: autosave every N *productive* loops, not every N total loops.
+        if productive_loops > 0 and productive_loops % AUTOSAVE_INTERVAL == 0:
             try:
-                save_messages(output_file, list(reversed(ordered_list)))
+                # ordered_list is already oldest-first (prepend strategy keeps it that way).
+                save_messages(output_file, ordered_list)
                 save_checkpoint(output_file, seen_hashes, ordered_list)
             except Exception as exc:
                 logging.warning("Autosave failed: %s", exc)
@@ -549,8 +622,9 @@ def main():
 
         prev_state = new_state
 
-    # Final save in chronological order
-    ordered_list.reverse()
+    # Final save in chronological order (oldest first).
+    # ordered_list is already oldest-first: prepending older batches throughout
+    # the crawl maintains that order naturally. No reversal needed.
     save_messages(output_file, ordered_list)
     delete_checkpoint(output_file)
 
